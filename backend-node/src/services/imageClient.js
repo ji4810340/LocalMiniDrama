@@ -98,7 +98,26 @@ function inferProtocol(provider, model) {
   if (p === 'kling' || p === 'klingai') return 'kling';
   if (/^kling-/i.test(model || '')) return 'kling';
   if (p === 'agnes' || /agnes-image|apihub\.agnes-ai\.com/i.test(String(model || ''))) return 'agnes';
+  if (p === 'minimax') return 'minimax';
   return 'openai';
+}
+
+/**
+ * 构建参考图请求体字段
+ * - 硅基流动 Qwen-Image-Edit-2509：image / image2 / image3 分开传（字符串）
+ * - 其他平台（volcengine等）：image 数组
+ */
+function buildRefImagesBody(provider, resolvedRefs) {
+  const p = String(provider || '').toLowerCase();
+  // 硅基流动 Qwen-Image-Edit 系列：参考图拆成 image/image2/image3
+  if (p === 'siliconflow') {
+    const body = { image: resolvedRefs[0] };
+    if (resolvedRefs.length > 1) body.image2 = resolvedRefs[1];
+    if (resolvedRefs.length > 2) body.image3 = resolvedRefs[2];
+    return body;
+  }
+  // 默认：数组形式
+  return { image: resolvedRefs };
 }
 
 /**
@@ -1407,6 +1426,91 @@ async function callGeminiImageApi(db, config, log, opts) {
 }
 
 /**
+ * MiniMax image-01 图片生成 API
+ * POST /v1/image_generation
+ * Body: { model, prompt, aspect_ratio, subject_reference? }
+ * Response: { data: { image_url } }
+ */
+async function callMiniMaxImageApi(config, log, opts) {
+  const { prompt, model, size, image_gen_id } = opts;
+  const baseUrl = (config.base_url || 'https://api.minimax.cn/v1').replace(/\/$/, '');
+  const url = baseUrl + '/image_generation';
+
+  // 从 size 推断 aspect_ratio（如 1920x1080 → 16:9）
+  let aspectRatio = '16:9';
+  if (size && size.includes('x')) {
+    const [w, h] = size.split('x').map(Number);
+    if (w === h) aspectRatio = '1:1';
+    else if (w > h) aspectRatio = (w / h > 1.5) ? '16:9' : '3:2';
+    else aspectRatio = (h / w > 1.5) ? '9:16' : '2:3';
+  }
+
+  const body = {
+    model: model || 'image-01',
+    prompt,
+    aspect_ratio: aspectRatio,
+  };
+
+  // 参考图支持：MiniMax 每次仅支持一张人物主体参考图
+  const refs = Array.isArray(opts.reference_image_urls) ? opts.reference_image_urls.filter(Boolean) : [];
+  if (refs.length > 0) {
+    const firstRef = refs[0];
+    // 解析参考图：localhost路径 → base64，公网URL → 直接传
+    const resolved = resolveImageRef(firstRef, opts.files_base_url, opts.storage_local_path);
+    if (resolved) {
+      body.subject_reference = [
+        {
+          type: 'character',
+          image_file: resolved,
+        },
+      ];
+      log.info('[MiniMax] 参考图已传入', { image_gen_id, ref_type: resolved.startsWith('data:') ? 'base64' : 'url' });
+    }
+  }
+
+  log.info('[MiniMax] Image API request', { image_gen_id, url: url.slice(0, 60), model: body.model, aspect_ratio: aspectRatio, has_ref: !!body.subject_reference });
+
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: 'Bearer ' + (config.api_key || ''),
+  };
+
+  let raw;
+  let httpStatus;
+  try {
+    const out = await postJSONWithTimeout(url, headers, body, IMAGE_HTTP_TIMEOUT_MS);
+    httpStatus = out.statusCode;
+    raw = out.raw;
+  } catch (e) {
+    log.error('[MiniMax] Image API network error', { image_gen_id, error: e.message });
+    return { error: 'MiniMax图片生成网络请求失败: ' + e.message };
+  }
+
+  if (httpStatus < 200 || httpStatus >= 300) {
+    log.error('[MiniMax] Image API failed', { status: httpStatus, body: raw.slice(0, 300) });
+    return { error: 'MiniMax图片生成失败: ' + httpStatus + ' - ' + raw.slice(0, 200) };
+  }
+
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (e) {
+    log.warn('[MiniMax] Image API response parse error', { image_gen_id, raw_preview: raw.slice(0, 200) });
+    return { error: 'MiniMax图片生成返回格式异常' };
+  }
+
+  // MiniMax 返回格式：{ data: { image_url: "..." } }
+  const imageUrl = data?.data?.image_url || data?.image_url;
+  if (!imageUrl) {
+    log.warn('[MiniMax] No image_url in response', { image_gen_id, data_preview: JSON.stringify(data).slice(0, 200) });
+    return { error: 'MiniMax未返回图片地址' };
+  }
+
+  log.info('[MiniMax] Image generated successfully', { image_gen_id, image_url: imageUrl.slice(0, 80) });
+  return { image_url: imageUrl };
+}
+
+/**
  * 调用提供商图片生成 API（OpenAI /images/generations 风格 或 通义万象 multimodal-generation）
  * @param {object} db - database
  * @param {object} log - logger
@@ -1519,6 +1623,15 @@ async function callImageApi(db, log, opts) {
     });
   }
 
+  if (protocol === 'minimax') {
+    return callMiniMaxImageApi(config, log, {
+      prompt: effectivePrompt, model, size, image_gen_id,
+      reference_image_urls: opts.reference_image_urls,
+      files_base_url: opts.files_base_url,
+      storage_local_path: opts.storage_local_path,
+    });
+  }
+
   const url = buildImageUrl(config);
   const isVolc = protocol === 'volcengine';
   const isAgnes = isAgnesImageConfig(config, model);
@@ -1557,8 +1670,10 @@ async function callImageApi(db, log, opts) {
     // 多张参考图时加 negative_prompt，防止模型把参考图拼成左右分割的合图
     // Doubao/Seedream 原生支持；通用 OpenAI-compat 接口大多也会接受该字段（不支持的会忽略）
     ...(mergedNegativePrompt ? { negative_prompt: mergedNegativePrompt } : {}),
-    // 参考图字段：volcengine doubao-seedream API 规范使用 image（数组），见官方文档
-    ...(resolvedRefs.length > 0 && !isAgnes ? { image: resolvedRefs } : {}),
+    // 参考图字段：
+    // - volcengine doubao-seedream API 规范使用 image（数组）
+    // - 硅基流动 Qwen-Image-Edit-2509 使用 image/image2/image3 分开传（不是数组）
+    ...(resolvedRefs.length > 0 && !isAgnes ? buildRefImagesBody(provider, resolvedRefs) : {}),
     // Agnes Image 2.x：response_format 必须放 extra_body；参考图走 extra_body.image
     ...(isAgnes ? {
       extra_body: {
