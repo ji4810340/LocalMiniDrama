@@ -257,6 +257,30 @@ function setupRouter(cfg, db, log) {
   r.get('/videos/:id', videos.get);
   r.delete('/videos/:id', videos.delete);
 
+  // 视频代理：OpenRouter 等需认证的视频URL，后端带API Key转发
+  r.get('/video-proxy', async (req, res) => {
+    const targetUrl = String(req.query.url || '');
+    if (!targetUrl) return res.status(400).json({ error: 'url 必填' });
+    try {
+      const row = db.prepare(
+        "SELECT api_key FROM ai_service_configs WHERE provider='openrouter' AND deleted_at IS NULL LIMIT 1"
+      ).get();
+      const apiKey = row?.api_key || '';
+      const headers = {};
+      if (apiKey && /openrouter\.ai/i.test(targetUrl)) {
+        headers['Authorization'] = 'Bearer ' + apiKey;
+      }
+      const upstream = await fetch(targetUrl, { headers, redirect: 'follow' });
+      const ct = upstream.headers.get('content-type') || 'video/mp4';
+      res.setHeader('Content-Type', ct);
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      res.send(buf);
+    } catch (e) {
+      res.status(502).json({ error: '视频代理失败: ' + e.message });
+    }
+  });
+
   // ---------- video-merges ----------
   r.get('/video-merges', videoMerges.list);
   r.post('/video-merges', videoMerges.create);

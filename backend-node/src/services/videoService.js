@@ -9,6 +9,15 @@ function resolveRemoteVideoUrl(videoUrl, fallbackError) {
   return { ok: false, error: (fallbackError || '超时或失败').slice(0, 500) };
 }
 
+/** OpenRouter 等需认证的视频URL，前端直接访问会401，重写为本地代理地址 */
+function rewriteVideoUrlForClient(videoUrl) {
+  if (!videoUrl || typeof videoUrl !== 'string') return videoUrl;
+  if (/openrouter\.ai\/api\/v1\/videos\//i.test(videoUrl)) {
+    return '/api/v1/video-proxy?url=' + encodeURIComponent(videoUrl);
+  }
+  return videoUrl;
+}
+
 /** 将 video_generations 标为失败；若无 error_msg 列则只更新 status/updated_at */
 function setVideoGenFailed(db, videoGenId, errorMsg, now) {
   try {
@@ -64,7 +73,7 @@ function rowToItem(r) {
     model: r.model,
     image_gen_id: r.image_gen_id,
     image_url: r.image_url,
-    video_url: r.video_url,
+    video_url: rewriteVideoUrlForClient(r.video_url),
     local_path: r.local_path,
     status: r.status,
     task_id: r.task_id,
@@ -228,7 +237,8 @@ function resolveStoragePath(cfg) {
 async function finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, videoUrl, logLabel, aiConfig = null) {
   const now = new Date().toISOString();
   let localPath = null;
-  const requireAuthDownload = videoClient.isCheapSeedance2Provider(aiConfig?.provider || row?.provider);
+  const requireAuthDownload = videoClient.isCheapSeedance2Provider(aiConfig?.provider || row?.provider)
+    || (videoUrl && /openrouter\.ai\/api\/v1\/videos\//i.test(videoUrl));
   const downloadOpts = requireAuthDownload && aiConfig?.api_key
     ? { apiKey: aiConfig.api_key }
     : null;
@@ -550,8 +560,8 @@ async function processVideoGeneration(db, log, videoGenId) {
       provider: row.provider,
       drama_id: row.drama_id,
       storyboard_id: row.storyboard_id || undefined,
-      image_url: hasOmniRefs ? undefined : row.image_url,
-      first_frame_url: hasOmniRefs ? undefined : row.first_frame_url,
+      image_url: hasOmniRefs ? reference_urls[0] : row.image_url,
+      first_frame_url: hasOmniRefs ? reference_urls[0] : row.first_frame_url,
       last_frame_url: hasOmniRefs ? undefined : row.last_frame_url,
       reference_urls,
       files_base_url: filesBaseUrl,

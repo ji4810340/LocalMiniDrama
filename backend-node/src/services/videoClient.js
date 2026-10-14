@@ -3792,9 +3792,25 @@ function resolveVolcClassicImage(rawUrl, files_base_url, storage_local_path, log
       const filePath = path.join(storage_local_path, rel);
       try {
         if (fs.existsSync(filePath)) {
-          const buf = fs.readFileSync(filePath);
-          const ext = path.extname(filePath).toLowerCase();
-          const mime = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.bmp': 'image/bmp' }[ext] || 'image/png';
+          let buf = fs.readFileSync(filePath);
+          let mime = 'image/png';
+          // 超过4MB的图片压缩成JPEG，避免HeyGen 5MB限制
+          if (buf.length > 4 * 1024 * 1024) {
+            try {
+              const sharp = require('sharp');
+              // sharp是异步的，用Promise同步等待
+              // 但这个函数是同步的，我们用execSync调用sips压缩
+              const { execSync } = require('child_process');
+              const tmpFile = `/tmp/_frame_compress_${Date.now()}.jpg`;
+              execSync(`sips -s format jpeg -s formatOptions 80 "${filePath}" --out "${tmpFile}"`, { stdio: 'ignore' });
+              buf = fs.readFileSync(tmpFile);
+              mime = 'image/jpeg';
+              fs.unlinkSync(tmpFile);
+              if (log && log.info) {
+                log.info('[Volc] 大图已压缩为JPEG', { video_gen_id, compressed_size: buf.length });
+              }
+            } catch (_) {}
+          }
           const b64 = 'data:' + mime + ';base64,' + buf.toString('base64');
           if (log && log.info) {
             log.info('[Volc] 本地首/尾帧已转为 base64 提交', { video_gen_id, role: roleHint, rel: rel.slice(0, 80) });
@@ -4374,6 +4390,15 @@ async function callVideoApi(db, log, opts) {
     const p = { type: 'image_url', image_url: { url: lastForApi } };
     p.role = 'last_frame';
     body.content.push(p);
+  }
+
+  // OpenRouter 视频API格式：frame_images（HeyGen等模型认这个字段）
+  const isOpenRouterVideos = /openrouter\.ai\/api\/v1\/videos/i.test(url);
+  if (isOpenRouterVideos) {
+    const frameImages = [];
+    if (firstForApi) frameImages.push({ type: 'image_url', frame_type: 'first_frame', image_url: { url: firstForApi } });
+    if (lastForApi) frameImages.push({ type: 'image_url', frame_type: 'last_frame', image_url: { url: lastForApi } });
+    if (frameImages.length) body.frame_images = frameImages;
   }
 
   // 向后兼容：没有任何 first/last 字段时，单张 image_url 仍按老逻辑作为 first_frame（i2v）

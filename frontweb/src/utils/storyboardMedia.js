@@ -111,10 +111,15 @@ export function videoRecordUrl(record) {
   if (!record) return ''
   const localPath = record.local_path && String(record.local_path).trim()
   if (localPath) return '/static/' + localPath.replace(/^\//, '')
-  if (record.video_url && isHttpVideoUrl(record.video_url)) return record.video_url
   if (record.video_url) {
     const p = String(record.video_url).trim()
+    // OpenRouter 等需认证的视频URL，走本地代理
+    if (/openrouter\.ai\/api\/v1\/videos\//i.test(p)) {
+      return '/api/v1/video-proxy?url=' + encodeURIComponent(p)
+    }
+    if (p.startsWith('/api/')) return p
     if (p.startsWith('/static/')) return p
+    if (isHttpVideoUrl(p)) return p
     if (!p.startsWith('http')) return '/static/' + p.replace(/^\//, '')
     return p
   }
