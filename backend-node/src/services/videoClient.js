@@ -1332,6 +1332,11 @@ function pickVideoUrlFromResultShape(obj) {
  */
 function pickProxyVideoUrl(data) {
   if (!data || typeof data !== 'object') return null;
+  // OpenRouter / HeyGen: 视频地址在 unsigned_urls 数组
+  if (Array.isArray(data.unsigned_urls) && data.unsigned_urls.length > 0) {
+    const uu = coerceHttpVideoUrl(data.unsigned_urls[0]);
+    if (uu) return uu;
+  }
   const topList = pickVideoUrlFromItemList(data.item_list);
   if (topList) return topList;
   if (data.video && typeof data.video === 'object') {
@@ -4300,7 +4305,7 @@ async function callVideoApi(db, log, opts) {
   }
 
   const url = buildVideoUrl(config);
-  const dur = duration ? Number(duration) : 5;
+  const dur = duration ? Math.round(Number(duration)) : 5;
   const ratio = aspect_ratio || '16:9';
 
   const isVolc = protocol === 'volcengine';
@@ -4348,6 +4353,7 @@ async function callVideoApi(db, log, opts) {
   const body = {
     model: finalModel,
     content: [{ type: 'text', text: prompt || '' }],
+    prompt: prompt || '',
     ratio,
     aspect_ratio: ratio,
     duration: effectiveDuration,
